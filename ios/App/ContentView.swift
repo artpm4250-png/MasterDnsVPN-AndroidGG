@@ -1,5 +1,6 @@
 import Combine
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct AppLogEntry: Identifiable, Equatable {
@@ -25,7 +26,7 @@ struct AppLogEntry: Identifiable, Equatable {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var profile = MasterDNSProfile.empty
+    @Published var library = ProfileStore.loadLibrary()
     @Published var message = ""
     @Published var showingConfigImporter = false
     @Published var showingResolversImporter = false
@@ -35,6 +36,7 @@ final class AppModel: ObservableObject {
     let vpn = VPNController()
     let proxy = LocalProxyController()
     private var cancellables = Set<AnyCancellable>()
+    private var seenRuntimeLogLines = Set<String>()
 
     init() {
         vpn.objectWillChange
@@ -44,19 +46,32 @@ final class AppModel: ObservableObject {
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
         append(.info, "Приложение готово")
+        Timer.publish(every: 1.5, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.pollRuntimeLogs() }
+            .store(in: &cancellables)
+    }
+
+    var profile: MasterDNSProfile {
+        library.selectedProfile
     }
 
     func refresh() async {
-        profile = ProfileStore.load()
+        library = ProfileStore.loadLibrary()
         await vpn.load()
+        pollRuntimeLogs()
     }
 
-    func saveProfile(_ next: MasterDNSProfile, note: String = "Профиль сохранен") {
+    func saveProfile(_ next: MasterDNSProfile, note: String = "Профиль сохранен", log: Bool = true) {
         do {
-            try ProfileStore.save(next)
-            profile = next
-            message = note
-            append(.info, note)
+            var updated = library
+            updated.updateSelected(next)
+            try ProfileStore.saveLibrary(updated)
+            library = updated
+            if log {
+                message = note
+                append(.info, note)
+            }
         } catch {
             message = error.localizedDescription
             append(.error, error.localizedDescription)
@@ -72,6 +87,58 @@ final class AppModel: ObservableObject {
         } catch {
             message = "Не удалось импортировать конфиг"
             append(.error, message)
+        }
+    }
+
+    func selectProfile(_ id: String) {
+        var updated = library
+        updated.select(id)
+        do {
+            try ProfileStore.saveLibrary(updated)
+            library = updated
+            append(.info, "Выбран профиль: \(profile.name)")
+        } catch {
+            append(.error, error.localizedDescription)
+        }
+    }
+
+    func addProfile() {
+        var updated = library
+        updated.addBlankProfile()
+        do {
+            try ProfileStore.saveLibrary(updated)
+            library = updated
+            message = "Создан новый профиль"
+            append(.info, message)
+        } catch {
+            append(.error, error.localizedDescription)
+        }
+    }
+
+    func duplicateProfile() {
+        var updated = library
+        updated.duplicateSelected()
+        do {
+            try ProfileStore.saveLibrary(updated)
+            library = updated
+            message = "Профиль скопирован"
+            append(.info, message)
+        } catch {
+            append(.error, error.localizedDescription)
+        }
+    }
+
+    func deleteProfile() {
+        var updated = library
+        let deleted = profile.name
+        updated.deleteSelected()
+        do {
+            try ProfileStore.saveLibrary(updated)
+            library = updated
+            message = "Профиль удален"
+            append(.warn, "Удален профиль: \(deleted)")
+        } catch {
+            append(.error, error.localizedDescription)
         }
     }
 
@@ -97,6 +164,7 @@ final class AppModel: ObservableObject {
                 append(.warn, message)
             } else {
                 _ = try ProfileStore.loadRequired()
+                try ProfileStore.saveLibrary(library)
                 try await vpn.start()
                 message = "VPN запускается"
                 append(.info, message)
@@ -115,6 +183,7 @@ final class AppModel: ObservableObject {
             append(.warn, message)
         } else {
             do {
+                try ProfileStore.saveLibrary(library)
                 let profile = try ProfileStore.loadRequired()
                 await proxy.start(profile: profile)
                 message = proxy.lastError ?? "Локальный SOCKS запущен"
@@ -131,11 +200,54 @@ final class AppModel: ObservableObject {
         append(.info, "Логи очищены")
     }
 
+    func copyProxyAddress() {
+        UIPasteboard.general.string = "socks5://\(profile.listenAddress)"
+        message = "SOCKS-адрес скопирован"
+        append(.info, message)
+    }
+
+    func copyProfileConfig() {
+        UIPasteboard.general.string = profile.clientConfigToml
+        message = "TOML скопирован"
+        append(.info, message)
+    }
+
+    func copyResolvers() {
+        UIPasteboard.general.string = profile.resolversText
+        message = "Резолверы скопированы"
+        append(.info, message)
+    }
+
     func append(_ level: AppLogEntry.Level, _ text: String) {
         logs.append(AppLogEntry(date: Date(), level: level, message: text))
         if logs.count > 250 {
             logs.removeFirst(logs.count - 250)
         }
+    }
+
+    private func pollRuntimeLogs() {
+        for dir in ["packet-tunnel", "local-proxy"] {
+            let url = ProfileStore.runtimeURL
+                .appendingPathComponent(dir, isDirectory: true)
+                .appendingPathComponent("client.log")
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            let lines = text.split(whereSeparator: \.isNewline).map(String.init).suffix(30)
+            for line in lines {
+                let key = "\(dir):\(line)"
+                guard !seenRuntimeLogLines.contains(key) else { continue }
+                seenRuntimeLogLines.insert(key)
+                append(parseLogLevel(line), "\(dir): \(line)")
+            }
+        }
+        if seenRuntimeLogLines.count > 500 {
+            seenRuntimeLogLines.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func parseLogLevel(_ line: String) -> AppLogEntry.Level {
+        if line.contains("[ERROR]") { return .error }
+        if line.contains("[WARN]") { return .warn }
+        return .info
     }
 }
 
@@ -250,7 +362,7 @@ private struct ProfileCard: View {
                         Text(model.profile.name)
                             .font(.headline)
                             .lineLimit(1)
-                        Text(profileStateText)
+                        Text("\(profileStateText) · \(model.library.profiles.count) проф.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -273,8 +385,7 @@ private struct ProfileCard: View {
     }
 
     private var profileReady: Bool {
-        !model.profile.clientConfigToml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !model.profile.resolversText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        model.profile.isReady
     }
 
     private var profileStateText: String {
@@ -314,6 +425,24 @@ private struct QuickActionsCard: View {
                         model.showingConfigImporter = true
                     } label: {
                         Label("TOML", systemImage: "square.and.arrow.down")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        model.showingResolversImporter = true
+                    } label: {
+                        Label("DNS list", systemImage: "list.bullet.rectangle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        model.copyProxyAddress()
+                    } label: {
+                        Label("SOCKS URL", systemImage: "doc.on.clipboard")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -362,7 +491,7 @@ private struct DashboardTab: View {
                             StatRow("VPN", model.vpn.status.label, good: model.vpn.status.isActive)
                             StatRow("SOCKS", model.proxy.isRunning ? "Запущен" : "Остановлен", good: model.proxy.isRunning)
                             StatRow("Адрес", model.profile.listenAddress, good: true)
-                            StatRow("Резолверы", "\(resolverCount)", good: resolverCount > 0)
+                            StatRow("Резолверы", "\(model.profile.resolverCount)", good: model.profile.resolverCount > 0)
                         }
                     }
                     AppCard {
@@ -386,12 +515,6 @@ private struct DashboardTab: View {
         }
     }
 
-    private var resolverCount: Int {
-        model.profile.resolversText
-            .split(whereSeparator: \.isNewline)
-            .filter { !String($0).trimmingCharacters(in: .whitespaces).isEmpty }
-            .count
-    }
 }
 
 private struct ProfileTab: View {
@@ -401,6 +524,50 @@ private struct ProfileTab: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 12) {
+                    AppCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("Профили")
+                                    .font(.headline)
+                                Spacer()
+                                Button {
+                                    model.addProfile()
+                                } label: {
+                                    Image(systemName: "plus")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+
+                            ForEach(model.library.profiles) { profile in
+                                ProfileRow(
+                                    profile: profile,
+                                    selected: profile.id == model.library.selectedProfileID
+                                ) {
+                                    model.selectProfile(profile.id)
+                                }
+                            }
+
+                            HStack(spacing: 10) {
+                                Button {
+                                    model.duplicateProfile()
+                                } label: {
+                                    Label("Копия", systemImage: "doc.on.doc")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button(role: .destructive) {
+                                    model.deleteProfile()
+                                } label: {
+                                    Label("Удалить", systemImage: "trash")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    }
+
                     AppCard {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Импорт")
@@ -437,6 +604,14 @@ private struct ProfileTab: View {
                                     model.saveProfile(next)
                                 }
                             ))
+                            EditableField("SOCKS", text: Binding(
+                                get: { model.profile.listenAddress },
+                                set: {
+                                    var next = model.profile
+                                    next.listenAddress = $0
+                                    model.saveProfile(next)
+                                }
+                            ))
                             Stepper("MTU \(model.profile.mtu)", value: Binding(
                                 get: { model.profile.mtu },
                                 set: {
@@ -453,12 +628,43 @@ private struct ProfileTab: View {
                             Text("Данные профиля")
                                 .font(.headline)
                             Text("TOML: \(model.profile.clientConfigToml.isEmpty ? "нет" : "есть")")
-                            Text("Резолверы: \(resolverCount)")
+                            Text("Резолверы: \(model.profile.resolverCount)")
                             Text("SOCKS: \(model.profile.listenAddress)")
+                            HStack(spacing: 10) {
+                                Button("Копировать SOCKS") { model.copyProxyAddress() }
+                                    .buttonStyle(.bordered)
+                                Button("Копировать TOML") { model.copyProfileConfig() }
+                                    .buttonStyle(.bordered)
+                            }
                         }
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    AppCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Резолверы")
+                                    .font(.headline)
+                                Spacer()
+                                Button("Копировать") { model.copyResolvers() }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                            }
+                            TextEditor(text: Binding(
+                                get: { model.profile.resolversText },
+                                set: {
+                                    var next = model.profile
+                                    next.resolversText = $0
+                                    model.saveProfile(next, note: "Резолверы обновлены", log: false)
+                                }
+                            ))
+                            .font(.system(.footnote, design: .monospaced))
+                            .frame(minHeight: 150)
+                            .background(Color(.tertiarySystemGroupedBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
                     }
                 }
                 .padding(14)
@@ -468,12 +674,36 @@ private struct ProfileTab: View {
             .navigationBarTitleDisplayMode(.inline)
         }
     }
+}
 
-    private var resolverCount: Int {
-        model.profile.resolversText
-            .split(whereSeparator: \.isNewline)
-            .filter { !String($0).trimmingCharacters(in: .whitespaces).isEmpty }
-            .count
+private struct ProfileRow: View {
+    let profile: MasterDNSProfile
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(selected ? .green : .secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(profile.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    Text("\(profile.listenAddress) · \(profile.resolverCount) DNS")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                StatusPill(text: profile.isReady ? "READY" : "SETUP", color: profile.isReady ? .green : .orange)
+            }
+            .padding(10)
+            .background(selected ? Color.green.opacity(0.08) : Color(.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 }
 
