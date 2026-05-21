@@ -297,7 +297,9 @@ func drainOutboundPackets(ctx context.Context, ep *channel.Endpoint, writer Pack
 		if pkt == nil {
 			return
 		}
-		data := pkt.ToBuffer().Flatten()
+		buf := pkt.ToBuffer()
+		data := buf.Flatten()
+		buf.Release()
 		pkt.DecRef()
 		if len(data) == 0 {
 			continue
