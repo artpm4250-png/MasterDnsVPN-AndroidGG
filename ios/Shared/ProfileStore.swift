@@ -314,9 +314,9 @@ enum MasterDNSToml {
         var inSingle = false
         var inDouble = false
         var result = ""
-        let singleQuote = UnicodeScalar("'")!
-        let doubleQuote = UnicodeScalar("\"")!
-        let comment = UnicodeScalar("#")!
+        let singleQuote = UnicodeScalar("'")
+        let doubleQuote = UnicodeScalar("\"")
+        let comment = UnicodeScalar("#")
         for scalar in line.unicodeScalars {
             if scalar == doubleQuote && !inSingle {
                 inDouble.toggle()
