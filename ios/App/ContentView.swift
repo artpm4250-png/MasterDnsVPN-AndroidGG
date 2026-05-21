@@ -30,6 +30,10 @@ final class AppModel: ObservableObject {
     @Published var message = ""
     @Published var showingConfigImporter = false
     @Published var showingResolversImporter = false
+    @Published var showingConfigPasteSheet = false
+    @Published var showingResolversPasteSheet = false
+    @Published var configPasteText = ""
+    @Published var resolversPasteText = ""
     @Published var selectedTab = 0
     @Published var logs: [AppLogEntry] = []
 
@@ -82,12 +86,33 @@ final class AppModel: ObservableObject {
         do {
             let ok = url.startAccessingSecurityScopedResource()
             defer { if ok { url.stopAccessingSecurityScopedResource() } }
-            let text = try String(contentsOf: url, encoding: .utf8)
-            saveProfile(MasterDNSToml.applyingConfig(text, to: profile), note: "TOML-конфиг импортирован")
+            let text = try readTextFile(url)
+            importConfigText(text, source: url.lastPathComponent)
         } catch {
-            message = "Не удалось импортировать конфиг"
+            message = "Не удалось импортировать TOML: \(error.localizedDescription)"
             append(.error, message)
         }
+    }
+
+    func importConfigText(_ text: String, source: String = "буфер") {
+        do {
+            let cleaned = try MasterDNSToml.normalizedConfig(text)
+            let next = MasterDNSToml.applyingConfig(cleaned, to: profile)
+            saveProfile(next, note: "TOML импортирован: \(source)")
+        } catch {
+            message = error.localizedDescription
+            append(.error, message)
+        }
+    }
+
+    func beginPasteConfig() {
+        configPasteText = UIPasteboard.general.string ?? ""
+        showingConfigPasteSheet = true
+    }
+
+    func finishPasteConfig() {
+        importConfigText(configPasteText)
+        showingConfigPasteSheet = false
     }
 
     func selectProfile(_ id: String) {
@@ -146,14 +171,34 @@ final class AppModel: ObservableObject {
         do {
             let ok = url.startAccessingSecurityScopedResource()
             defer { if ok { url.stopAccessingSecurityScopedResource() } }
-            let text = try String(contentsOf: url, encoding: .utf8)
-            var next = profile
-            next.resolversText = text
-            saveProfile(next, note: "Резолверы импортированы")
+            let text = try readTextFile(url)
+            importResolversText(text, source: url.lastPathComponent)
         } catch {
-            message = "Не удалось импортировать резолверы"
+            message = "Не удалось импортировать резолверы: \(error.localizedDescription)"
             append(.error, message)
         }
+    }
+
+    func importResolversText(_ text: String, source: String = "буфер") {
+        do {
+            let cleaned = try MasterDNSResolvers.normalizedList(text)
+            var next = profile
+            next.resolversText = cleaned
+            saveProfile(next, note: "Резолверы импортированы: \(source)")
+        } catch {
+            message = error.localizedDescription
+            append(.error, message)
+        }
+    }
+
+    func beginPasteResolvers() {
+        resolversPasteText = UIPasteboard.general.string ?? ""
+        showingResolversPasteSheet = true
+    }
+
+    func finishPasteResolvers() {
+        importResolversText(resolversPasteText)
+        showingResolversPasteSheet = false
     }
 
     func toggleVPN() async {
@@ -249,6 +294,22 @@ final class AppModel: ObservableObject {
         if line.contains("[WARN]") { return .warn }
         return .info
     }
+
+    private func readTextFile(_ url: URL) throws -> String {
+        let data = try Data(contentsOf: url)
+        if let utf8 = String(data: data, encoding: .utf8) {
+            return utf8
+        }
+        if let unicode = String(data: data, encoding: .unicode) {
+            return unicode
+        }
+        if let windows = String(data: data, encoding: .windowsCP1251) {
+            return windows
+        }
+        throw NSError(domain: "MasterDnsVPN", code: 20, userInfo: [
+            NSLocalizedDescriptionKey: "файл не похож на текстовый UTF-8/TOML"
+        ])
+    }
 }
 
 struct ContentView: View {
@@ -272,15 +333,43 @@ struct ContentView: View {
         .accentColor(.teal)
         .fileImporter(
             isPresented: $model.showingConfigImporter,
-            allowedContentTypes: [.plainText, .text, .data]
+            allowedContentTypes: [.toml, .plainText, .text, .data, .item]
         ) { result in
-            if case let .success(url) = result { model.importConfig(from: url) }
+            switch result {
+            case let .success(url):
+                model.importConfig(from: url)
+            case let .failure(error):
+                model.append(.error, "TOML picker: \(error.localizedDescription)")
+            }
         }
         .fileImporter(
             isPresented: $model.showingResolversImporter,
-            allowedContentTypes: [.plainText, .text, .data]
+            allowedContentTypes: [.plainText, .text, .data, .item]
         ) { result in
-            if case let .success(url) = result { model.importResolvers(from: url) }
+            switch result {
+            case let .success(url):
+                model.importResolvers(from: url)
+            case let .failure(error):
+                model.append(.error, "DNS picker: \(error.localizedDescription)")
+            }
+        }
+        .sheet(isPresented: $model.showingConfigPasteSheet) {
+            PasteSheet(
+                title: "Вставить client_config.toml",
+                text: $model.configPasteText,
+                actionTitle: "Импортировать TOML"
+            ) {
+                model.finishPasteConfig()
+            }
+        }
+        .sheet(isPresented: $model.showingResolversPasteSheet) {
+            PasteSheet(
+                title: "Вставить client_resolvers.txt",
+                text: $model.resolversPasteText,
+                actionTitle: "Импортировать DNS"
+            ) {
+                model.finishPasteResolvers()
+            }
         }
     }
 }
@@ -309,6 +398,49 @@ private struct HomeTab: View {
                     } label: {
                         Image(systemName: "doc.text")
                     }
+                }
+            }
+        }
+    }
+}
+
+private struct PasteSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    @Binding var text: String
+    let actionTitle: String
+    let onImport: () -> Void
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 12) {
+                TextEditor(text: $text)
+                    .font(.system(.footnote, design: .monospaced))
+                    .padding(8)
+                    .background(Color(.secondarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.18))
+                    )
+
+                Button {
+                    onImport()
+                } label: {
+                    Label(actionTitle, systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(14)
+            .background(AppTheme.background)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Закрыть") { dismiss() }
                 }
             }
         }
@@ -424,7 +556,7 @@ private struct QuickActionsCard: View {
                     Button {
                         model.showingConfigImporter = true
                     } label: {
-                        Label("TOML", systemImage: "square.and.arrow.down")
+                        Label("TOML файл", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -440,9 +572,9 @@ private struct QuickActionsCard: View {
                     .buttonStyle(.bordered)
 
                     Button {
-                        model.copyProxyAddress()
+                        model.beginPasteConfig()
                     } label: {
-                        Label("SOCKS URL", systemImage: "doc.on.clipboard")
+                        Label("TOML буфер", systemImage: "doc.on.clipboard")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -572,13 +704,39 @@ private struct ProfileTab: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Импорт")
                                 .font(.headline)
-                            HStack(spacing: 10) {
-                                Button("client_config.toml") {
+                            Text("Файлы Android/desktop MasterDnsVPN импортируются как raw TOML без пересборки полей.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            VStack(spacing: 10) {
+                                Button {
                                     model.showingConfigImporter = true
+                                } label: {
+                                    Label("Импортировать client_config.toml", systemImage: "square.and.arrow.down")
+                                        .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(.bordered)
-                                Button("client_resolvers.txt") {
+
+                                Button {
+                                    model.beginPasteConfig()
+                                } label: {
+                                    Label("Вставить TOML из буфера", systemImage: "doc.on.clipboard")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button {
                                     model.showingResolversImporter = true
+                                } label: {
+                                    Label("Импортировать client_resolvers.txt", systemImage: "list.bullet.rectangle")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button {
+                                    model.beginPasteResolvers()
+                                } label: {
+                                    Label("Вставить DNS из буфера", systemImage: "doc.plaintext")
+                                        .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(.bordered)
                             }
@@ -628,6 +786,7 @@ private struct ProfileTab: View {
                             Text("Данные профиля")
                                 .font(.headline)
                             Text("TOML: \(model.profile.clientConfigToml.isEmpty ? "нет" : "есть")")
+                            Text(model.profile.configSummary)
                             Text("Резолверы: \(model.profile.resolverCount)")
                             Text("SOCKS: \(model.profile.listenAddress)")
                             HStack(spacing: 10) {
@@ -849,5 +1008,11 @@ private struct EditableField: View {
                 .autocorrectionDisabled()
         }
         .font(.subheadline)
+    }
+}
+
+private extension UTType {
+    static var toml: UTType {
+        UTType(filenameExtension: "toml") ?? .plainText
     }
 }

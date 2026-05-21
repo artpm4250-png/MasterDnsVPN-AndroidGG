@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 enum AppGroup {
     static var identifier: String {
@@ -67,6 +68,10 @@ struct MasterDNSProfile: Codable, Equatable, Identifiable {
             .split(whereSeparator: \.isNewline)
             .filter { !String($0).trimmingCharacters(in: .whitespaces).isEmpty }
             .count
+    }
+
+    var configSummary: String {
+        MasterDNSToml.summary(for: clientConfigToml)
     }
 
     static let empty = MasterDNSProfile()
@@ -204,6 +209,44 @@ enum ProfileStore {
 }
 
 enum MasterDNSToml {
+    static func normalizedConfig(_ toml: String) throws -> String {
+        let cleaned = toml
+            .replacingOccurrences(of: "\u{feff}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            throw NSError(domain: "MasterDnsVPN", code: 30, userInfo: [
+                NSLocalizedDescriptionKey: "TOML пустой"
+            ])
+        }
+        guard firstDomain(in: cleaned) != nil else {
+            throw NSError(domain: "MasterDnsVPN", code: 31, userInfo: [
+                NSLocalizedDescriptionKey: "В TOML нет DOMAINS"
+            ])
+        }
+        guard let key = stringValue("ENCRYPTION_KEY", in: cleaned), !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "MasterDnsVPN", code: 32, userInfo: [
+                NSLocalizedDescriptionKey: "В TOML нет ENCRYPTION_KEY"
+            ])
+        }
+        if let method = intValue("DATA_ENCRYPTION_METHOD", in: cleaned), !(0...5).contains(method) {
+            throw NSError(domain: "MasterDnsVPN", code: 33, userInfo: [
+                NSLocalizedDescriptionKey: "DATA_ENCRYPTION_METHOD должен быть от 0 до 5"
+            ])
+        }
+        if let port = intValue("LISTEN_PORT", in: cleaned), !(0...65535).contains(port) {
+            throw NSError(domain: "MasterDnsVPN", code: 34, userInfo: [
+                NSLocalizedDescriptionKey: "LISTEN_PORT вне диапазона"
+            ])
+        }
+        if let protocolType = stringValue("PROTOCOL_TYPE", in: cleaned)?.uppercased(),
+           protocolType != "SOCKS5" && protocolType != "TCP" {
+            throw NSError(domain: "MasterDnsVPN", code: 35, userInfo: [
+                NSLocalizedDescriptionKey: "PROTOCOL_TYPE должен быть SOCKS5 или TCP"
+            ])
+        }
+        return cleaned + "\n"
+    }
+
     static func applyingConfig(_ toml: String, to profile: MasterDNSProfile) -> MasterDNSProfile {
         let listenIP = stringValue("LISTEN_IP", in: toml) ?? "127.0.0.1"
         let listenPort = intValue("LISTEN_PORT", in: toml) ?? 10808
@@ -216,31 +259,139 @@ enum MasterDNSToml {
     }
 
     static func stringValue(_ key: String, in toml: String) -> String? {
-        let escaped = NSRegularExpression.escapedPattern(for: key)
-        let pattern = #"(?m)^\s*\#(escaped)\s*=\s*"([^"]*)""#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(toml.startIndex..<toml.endIndex, in: toml)
-        guard let match = re.firstMatch(in: toml, range: range),
-              let valueRange = Range(match.range(at: 1), in: toml) else { return nil }
-        return String(toml[valueRange])
+        guard let raw = rawValue(key, in: toml) else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count >= 2,
+           let first = trimmed.first,
+           let last = trimmed.last,
+           (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+            return String(trimmed.dropFirst().dropLast())
+        }
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     static func intValue(_ key: String, in toml: String) -> Int? {
-        let escaped = NSRegularExpression.escapedPattern(for: key)
-        let pattern = #"(?m)^\s*\#(escaped)\s*=\s*([0-9]+)"#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(toml.startIndex..<toml.endIndex, in: toml)
-        guard let match = re.firstMatch(in: toml, range: range),
-              let valueRange = Range(match.range(at: 1), in: toml) else { return nil }
-        return Int(String(toml[valueRange]))
+        guard let raw = rawValue(key, in: toml) else { return nil }
+        return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     static func firstDomain(in toml: String) -> String? {
-        let pattern = #"(?m)^\s*DOMAINS\s*=\s*\[\s*"([^"]+)""#
+        guard let raw = rawValue("DOMAINS", in: toml) else { return nil }
+        let pattern = #"["']([^"']+)["']"#
         guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(toml.startIndex..<toml.endIndex, in: toml)
-        guard let match = re.firstMatch(in: toml, range: range),
-              let valueRange = Range(match.range(at: 1), in: toml) else { return nil }
-        return String(toml[valueRange])
+        let range = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+        guard let match = re.firstMatch(in: raw, range: range),
+              let valueRange = Range(match.range(at: 1), in: raw) else { return nil }
+        return String(raw[valueRange])
+    }
+
+    static func summary(for toml: String) -> String {
+        guard !toml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "TOML не импортирован"
+        }
+        let domain = firstDomain(in: toml) ?? "DOMAINS?"
+        let listenIP = stringValue("LISTEN_IP", in: toml) ?? "127.0.0.1"
+        let listenPort = intValue("LISTEN_PORT", in: toml) ?? 10808
+        let protocolType = stringValue("PROTOCOL_TYPE", in: toml) ?? "SOCKS5"
+        return "\(domain) · \(protocolType) · \(listenIP):\(listenPort)"
+    }
+
+    private static func rawValue(_ key: String, in toml: String) -> String? {
+        let prefix = key.uppercased()
+        for line in toml.components(separatedBy: .newlines) {
+            let stripped = stripInlineComment(line).trimmingCharacters(in: .whitespaces)
+            guard !stripped.isEmpty else { continue }
+            let parts = stripped.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let lhs = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard lhs == prefix else { continue }
+            return String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private static func stripInlineComment(_ line: String) -> String {
+        var inSingle = false
+        var inDouble = false
+        var result = ""
+        let singleQuote = UnicodeScalar("'")!
+        let doubleQuote = UnicodeScalar("\"")!
+        let comment = UnicodeScalar("#")!
+        for scalar in line.unicodeScalars {
+            if scalar == doubleQuote && !inSingle {
+                inDouble.toggle()
+            } else if scalar == singleQuote && !inDouble {
+                inSingle.toggle()
+            } else if scalar == comment && !inSingle && !inDouble {
+                break
+            }
+            result.unicodeScalars.append(scalar)
+        }
+        return result
+    }
+}
+
+enum MasterDNSResolvers {
+    static func normalizedList(_ text: String) throws -> String {
+        var valid: [String] = []
+        var seen = Set<String>()
+
+        for line in text.components(separatedBy: .newlines) {
+            let entry = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !entry.isEmpty else { continue }
+            guard isValidResolverEntry(entry) else { continue }
+            if seen.insert(entry).inserted {
+                valid.append(entry)
+            }
+        }
+
+        guard !valid.isEmpty else {
+            throw NSError(domain: "MasterDnsVPN", code: 40, userInfo: [
+                NSLocalizedDescriptionKey: "в списке нет валидных DNS/resolver endpoint"
+            ])
+        }
+        return valid.joined(separator: "\n") + "\n"
+    }
+
+    private static func isValidResolverEntry(_ entry: String) -> Bool {
+        let hostPart: String
+        if entry.hasPrefix("[") {
+            guard let end = entry.firstIndex(of: "]") else { return false }
+            hostPart = String(entry[entry.index(after: entry.startIndex)..<end])
+            let rest = entry[entry.index(after: end)...]
+            if !rest.isEmpty {
+                guard rest.first == ":" else { return false }
+                guard validPort(String(rest.dropFirst())) else { return false }
+            }
+        } else if let portSplit = splitIPv4HostPort(entry) {
+            hostPart = portSplit.host
+            guard validPort(portSplit.port) else { return false }
+        } else {
+            hostPart = entry
+        }
+
+        if let slash = hostPart.firstIndex(of: "/") {
+            let ip = String(hostPart[..<slash])
+            let bits = String(hostPart[hostPart.index(after: slash)...])
+            guard let prefix = Int(bits), (0...128).contains(prefix) else { return false }
+            return isIPAddress(ip)
+        }
+        return isIPAddress(hostPart)
+    }
+
+    private static func splitIPv4HostPort(_ entry: String) -> (host: String, port: String)? {
+        let parts = entry.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        return (String(parts[0]), String(parts[1]))
+    }
+
+    private static func validPort(_ text: String) -> Bool {
+        guard let port = Int(text) else { return false }
+        return (1...65535).contains(port)
+    }
+
+    private static func isIPAddress(_ text: String) -> Bool {
+        IPv4Address(text) != nil || IPv6Address(text) != nil
     }
 }

@@ -11,10 +11,14 @@
 
 - несколько профилей с выбором активного, созданием, копированием и удалением;
 - импорт Android/desktop `client_config.toml`;
+- вставка TOML из буфера, если iOS Files не отдает файл через document picker;
 - импорт и ручное редактирование `client_resolvers.txt`;
+- валидация обязательных MasterDnsVPN-полей `DOMAINS`, `ENCRYPTION_KEY`, `LISTEN_PORT`;
 - запуск системного VPN и отдельного локального SOCKS;
 - копирование SOCKS-ссылки, TOML и списка резолверов;
 - экран состояния и живые логи ядра из Packet Tunnel/локального SOCKS.
+
+Совместимость с MasterDnsVPN сделана через raw TOML: приложение сохраняет импортированный `client_config.toml` целиком и передает его Go-ядру без пересборки отдельных полей в Swift. Swift извлекает только название профиля и локальный listen address для UI/Packet Tunnel.
 
 Часть Android-функций зависит от возможностей платформы. На iOS нет прямого аналога Android Hotspot Sharing и per-app VPN без специальных entitlement/MDM-настроек, поэтому основной упор сделан на профили, локальный SOCKS и системный Packet Tunnel.
 
