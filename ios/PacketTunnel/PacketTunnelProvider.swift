@@ -109,9 +109,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             while !self.stopping {
                 autoreleasepool {
-                    guard let packet = MobileReadQueuedPacket(250), !packet.isEmpty else { continue }
-                    let proto = self.protocolNumber(for: packet)
-                    self.packetFlow.writePackets([packet], withProtocols: [proto])
+                    if let packet = MobileReadQueuedPacket(250), !packet.isEmpty {
+            let proto = self.protocolNumber(for: packet)
+            self.packetFlow.writePackets([packet], withProtocols: [proto])
+        }
                 }
             }
         }
@@ -122,4 +123,5 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return NSNumber(value: (first >> 4) == 6 ? AF_INET6 : AF_INET)
     }
 }
+
 
