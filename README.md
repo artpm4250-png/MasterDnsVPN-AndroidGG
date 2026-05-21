@@ -1,5 +1,11 @@
 # MasterDnsVPN Android Client
 
+## iOS Packet Tunnel
+
+This fork also contains an iOS client in `ios/`: SwiftUI app, Packet Tunnel extension, gomobile bridge, and a GitHub Actions workflow that builds an unsigned IPA. The iOS client imports the same `client_config.toml` plus `client_resolvers.txt`, starts the Go MasterDnsVPN engine, and routes traffic through NetworkExtension.
+
+To actually run the VPN tunnel on iPhone, the signing profile must include the `packet-tunnel-provider` entitlement. Without that entitlement the app can be built, but iOS will not start the tunnel.
+
 ## | [ نسخه فارسی](README_FA.md) |
 
 > **This is the Android client for [MasterDnsVPN](https://github.com/masterking32/MasterDnsVPN).**

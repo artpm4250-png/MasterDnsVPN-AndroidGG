@@ -38,6 +38,11 @@ android_mod/
 go.work
 go.work.sum
 android/signing.properties
+ios/Frameworks/*.xcframework
+ios/*.xcodeproj
+ios/*.xcworkspace
+ios/DerivedData/
+ios/build/
 .bench/
 .github/copilot-instructions.md
 client_config.toml.simple

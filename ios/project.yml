@@ -1,0 +1,47 @@
+name: MasterDnsVPNiOS
+options:
+  bundleIdPrefix: ru.pasklove
+  deploymentTarget:
+    iOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    DEVELOPMENT_TEAM: ""
+    APP_GROUP_ID: group.ru.pasklove.masterdns
+    APP_BUNDLE_ID: ru.pasklove.masterdns
+targets:
+  MasterDnsVPN:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Shared
+    dependencies:
+      - target: MasterDnsVPNPacketTunnel
+        embed: true
+      - framework: Frameworks/MasterDnsVPNCore.xcframework
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID)
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/MasterDnsVPN.entitlements
+        PRODUCT_NAME: MasterDnsVPN
+    scheme:
+      testTargets: []
+  MasterDnsVPNPacketTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - PacketTunnel
+      - Shared
+    dependencies:
+      - framework: Frameworks/MasterDnsVPNCore.xcframework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).PacketTunnel
+        INFOPLIST_FILE: PacketTunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        PRODUCT_NAME: MasterDnsVPNPacketTunnel

@@ -179,6 +179,13 @@ ic := toInternalConfig(cfg)
 return mobile.StartInstance(key, cfg.ProfileDir, ic, cfg.ResolversInline)
 }
 
+// StartRawInstance starts a tunnel from raw client_config.toml and resolver text.
+// This is the preferred entry point for iOS, where importing the Android TOML
+// directly is less fragile than mirroring every MobileConfig field in Swift.
+func StartRawInstance(key string, profileDir string, configToml string, resolversText string, listenAddr string) error {
+return mobile.StartRawInstance(key, profileDir, configToml, resolversText, listenAddr)
+}
+
 // StopInstance stops a running tunnel.
 func StopInstance(key string) {
 mobile.StopInstance(key)
