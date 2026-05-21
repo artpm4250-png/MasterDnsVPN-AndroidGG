@@ -48,15 +48,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         MobileStopInstance(instanceID)
         MobileStopPacketBridge()
-        try MobileStartRawInstance(
+        var startError: NSError?
+        guard MobileStartRawInstance(
             instanceID,
             dir.path,
             profile.clientConfigToml,
             profile.resolversText,
-            profile.listenAddress
-        )
+            profile.listenAddress,
+            &startError
+        ) else {
+            throw startError ?? NSError(domain: "MasterDnsVPN", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Не удалось запустить ядро MasterDnsVPN"
+            ])
+        }
         Thread.sleep(forTimeInterval: 0.35)
-        try MobileStartQueuedPacketBridge(Int32(profile.mtu), profile.listenAddress)
+        var bridgeError: NSError?
+        guard MobileStartQueuedPacketBridge(Int32(profile.mtu), profile.listenAddress, &bridgeError) else {
+            throw bridgeError ?? NSError(domain: "MasterDnsVPN", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "Не удалось запустить VPN-мост"
+            ])
+        }
     }
 
     private func stopEngine() {
@@ -86,7 +97,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self, !self.stopping else { return }
             for packet in packets where !packet.isEmpty {
-                try? MobileInjectPacket(packet)
+                var injectError: NSError?
+                _ = MobileInjectPacket(packet, &injectError)
             }
             self.startPacketReadLoop()
         }

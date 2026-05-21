@@ -14,13 +14,19 @@ final class LocalProxyController: ObservableObject {
         do {
             let dir = ProfileStore.runtimeURL.appendingPathComponent("local-proxy", isDirectory: true)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try MobileStartRawInstance(
+            var mobileError: NSError?
+            guard MobileStartRawInstance(
                 instanceID,
                 dir.path,
                 profile.clientConfigToml,
                 profile.resolversText,
-                profile.listenAddress
-            )
+                profile.listenAddress,
+                &mobileError
+            ) else {
+                throw mobileError ?? NSError(domain: "MasterDnsVPN", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "Не удалось запустить локальный SOCKS"
+                ])
+            }
             isRunning = true
         } catch {
             lastError = error.localizedDescription
