@@ -34,6 +34,7 @@ final class AppModel: ObservableObject {
     @Published var showingResolversPasteSheet = false
     @Published var configPasteText = ""
     @Published var resolversPasteText = ""
+    @Published var diagnostics: [String] = []
     @Published var selectedTab = 0
     @Published var logs: [AppLogEntry] = []
 
@@ -63,6 +64,7 @@ final class AppModel: ObservableObject {
     func refresh() async {
         library = ProfileStore.loadLibrary()
         await vpn.load()
+        proxy.refresh()
         pollRuntimeLogs()
     }
 
@@ -208,13 +210,17 @@ final class AppModel: ObservableObject {
                 message = "VPN остановлен"
                 append(.warn, message)
             } else {
-                _ = try ProfileStore.loadRequired()
+                let clean = try ProfileStore.loadRequired()
+                saveProfile(clean, note: "Профиль проверен", log: false)
                 try ProfileStore.saveLibrary(library)
                 try await vpn.start()
                 message = "VPN запускается"
                 append(.info, message)
             }
             await refresh()
+            if vpn.status.isActive {
+                await vpn.refreshProviderState()
+            }
         } catch {
             message = error.localizedDescription
             append(.error, message)
@@ -246,7 +252,7 @@ final class AppModel: ObservableObject {
     }
 
     func copyProxyAddress() {
-        UIPasteboard.general.string = "socks5://\(profile.listenAddress)"
+        UIPasteboard.general.string = profile.socksURL
         message = "SOCKS-адрес скопирован"
         append(.info, message)
     }
@@ -261,6 +267,50 @@ final class AppModel: ObservableObject {
         UIPasteboard.general.string = profile.resolversText
         message = "Резолверы скопированы"
         append(.info, message)
+    }
+
+    func validateProfile() {
+        let issues = profile.readinessIssues
+        if issues.isEmpty {
+            diagnostics = [
+                "Профиль готов",
+                profile.configSummary,
+                "Резолверов: \(profile.resolverCount)",
+                "SOCKS: \(profile.socksURL)"
+            ]
+            message = "Профиль готов к запуску"
+            append(.info, message)
+        } else {
+            diagnostics = issues
+            message = "Профиль требует исправлений"
+            for issue in issues {
+                append(.error, issue)
+            }
+        }
+    }
+
+    func refreshProviderState() async {
+        await vpn.refreshProviderState()
+        diagnostics = [
+            "VPN: \(vpn.status.label)",
+            "Extension: \(vpn.providerState)",
+            "SOCKS: \(proxy.stateText)"
+        ]
+        if let error = vpn.lastError {
+            append(.error, error)
+        }
+    }
+
+    func resetVPNProfile() async {
+        do {
+            try await vpn.resetVPNProfile()
+            message = "VPN-профиль iOS сброшен"
+            append(.warn, message)
+            await vpn.load()
+        } catch {
+            message = error.localizedDescription
+            append(.error, message)
+        }
     }
 
     func append(_ level: AppLogEntry.Level, _ text: String) {
@@ -442,6 +492,17 @@ private struct PasteSheet: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Закрыть") { dismiss() }
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Готово") {
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder),
+                            to: nil,
+                            from: nil,
+                            for: nil
+                        )
+                    }
+                }
             }
         }
     }
@@ -472,7 +533,7 @@ private struct HeaderCard: View {
                 Spacer()
 
                 StatusPill(
-                    text: model.vpn.status.isActive ? "ONLINE" : "OFF",
+                    text: model.vpn.status.isActive ? "ВКЛ" : "ВЫКЛ",
                     color: model.vpn.status.isActive ? .green : .secondary
                 )
             }
@@ -543,6 +604,7 @@ private struct QuickActionsCard: View {
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(!model.vpn.status.isActive && !model.profile.isReady)
 
                 HStack(spacing: 10) {
                     Button {
@@ -552,11 +614,12 @@ private struct QuickActionsCard: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                    .disabled(!model.proxy.isRunning && !model.profile.isReady)
 
                     Button {
-                        model.showingConfigImporter = true
+                        model.validateProfile()
                     } label: {
-                        Label("TOML файл", systemImage: "square.and.arrow.down")
+                        Label("Проверить", systemImage: "checkmark.shield")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -564,17 +627,17 @@ private struct QuickActionsCard: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        model.showingResolversImporter = true
+                        model.selectedTab = 2
                     } label: {
-                        Label("DNS list", systemImage: "list.bullet.rectangle")
+                        Label("Профиль", systemImage: "slider.horizontal.3")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
 
                     Button {
-                        model.beginPasteConfig()
+                        model.copyProxyAddress()
                     } label: {
-                        Label("TOML буфер", systemImage: "doc.on.clipboard")
+                        Label("SOCKS URL", systemImage: "link")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -601,6 +664,12 @@ private struct RuntimeCard: View {
                 Text(model.message.isEmpty ? "Готово" : model.message)
                     .font(.subheadline)
                     .foregroundColor(.secondary)
+                Text("SOCKS: \(model.proxy.stateText)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("Extension: \(model.vpn.providerState)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                 if let error = model.proxy.lastError {
                     Text(error)
                         .font(.caption)
@@ -621,7 +690,8 @@ private struct DashboardTab: View {
                     AppCard {
                         VStack(spacing: 12) {
                             StatRow("VPN", model.vpn.status.label, good: model.vpn.status.isActive)
-                            StatRow("SOCKS", model.proxy.isRunning ? "Запущен" : "Остановлен", good: model.proxy.isRunning)
+                            StatRow("Extension", model.vpn.providerState, good: model.vpn.providerState.contains("running"))
+                            StatRow("SOCKS", model.proxy.stateText, good: model.proxy.isRunning)
                             StatRow("Адрес", model.profile.listenAddress, good: true)
                             StatRow("Резолверы", "\(model.profile.resolverCount)", good: model.profile.resolverCount > 0)
                         }
@@ -635,14 +705,50 @@ private struct DashboardTab: View {
                             Text("MTU \(model.profile.mtu)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
+                            Text(model.profile.configSummary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    AppCard {
+                        VStack(spacing: 10) {
+                            Button {
+                                Task { await model.refreshProviderState() }
+                            } label: {
+                                Label("Обновить состояние", systemImage: "arrow.clockwise")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button(role: .destructive) {
+                                Task { await model.resetVPNProfile() }
+                            } label: {
+                                Label("Сбросить VPN-профиль iOS", systemImage: "trash")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    if !model.diagnostics.isEmpty {
+                        AppCard {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Диагностика")
+                                    .font(.headline)
+                                ForEach(model.diagnostics, id: \.self) { item in
+                                    Text(item)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                 }
                 .padding(14)
             }
             .background(AppTheme.background)
-            .navigationTitle("Dashboard")
+            .navigationTitle("Статус")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -795,10 +901,45 @@ private struct ProfileTab: View {
                                 Button("Копировать TOML") { model.copyProfileConfig() }
                                     .buttonStyle(.bordered)
                             }
+                            Button {
+                                model.validateProfile()
+                            } label: {
+                                Label("Проверить совместимость профиля", systemImage: "checkmark.shield")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
                         }
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    AppCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Raw TOML")
+                                    .font(.headline)
+                                Spacer()
+                                Button("Проверить") { model.validateProfile() }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                            }
+                            Text("Полный конфиг MasterDnsVPN хранится и запускается целиком.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            TextEditor(text: Binding(
+                                get: { model.profile.clientConfigToml },
+                                set: {
+                                    var next = MasterDNSToml.applyingConfig($0, to: model.profile)
+                                    next.clientConfigToml = $0
+                                    model.saveProfile(next, note: "TOML обновлен", log: false)
+                                }
+                            ))
+                            .font(.system(.footnote, design: .monospaced))
+                            .frame(minHeight: 220)
+                            .background(Color(.tertiarySystemGroupedBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
                     }
 
                     AppCard {
@@ -856,7 +997,7 @@ private struct ProfileRow: View {
                         .lineLimit(1)
                 }
                 Spacer()
-                StatusPill(text: profile.isReady ? "READY" : "SETUP", color: profile.isReady ? .green : .orange)
+                StatusPill(text: profile.isReady ? "ГОТОВ" : "НУЖНА НАСТРОЙКА", color: profile.isReady ? .green : .orange)
             }
             .padding(10)
             .background(selected ? Color.green.opacity(0.08) : Color(.tertiarySystemGroupedBackground))
@@ -923,7 +1064,7 @@ private struct AppCard<Content: View>: View {
         content
             .padding(14)
             .background(AppTheme.card)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

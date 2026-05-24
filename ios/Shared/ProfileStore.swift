@@ -24,7 +24,7 @@ struct MasterDNSProfile: Codable, Equatable, Identifiable {
         name: String = "MasterDnsVPN",
         clientConfigToml: String = "",
         resolversText: String = "",
-        listenAddress: String = "127.0.0.1:10808",
+        listenAddress: String = "127.0.0.1:18000",
         dnsServer: String = "8.8.8.8",
         mtu: Int = 1500,
         createdAt: Date = Date(),
@@ -51,7 +51,7 @@ struct MasterDNSProfile: Codable, Equatable, Identifiable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "MasterDnsVPN"
         clientConfigToml = try c.decodeIfPresent(String.self, forKey: .clientConfigToml) ?? ""
         resolversText = try c.decodeIfPresent(String.self, forKey: .resolversText) ?? ""
-        listenAddress = try c.decodeIfPresent(String.self, forKey: .listenAddress) ?? "127.0.0.1:10808"
+        listenAddress = try c.decodeIfPresent(String.self, forKey: .listenAddress) ?? "127.0.0.1:18000"
         dnsServer = try c.decodeIfPresent(String.self, forKey: .dnsServer) ?? "8.8.8.8"
         mtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 1500
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
@@ -72,6 +72,25 @@ struct MasterDNSProfile: Codable, Equatable, Identifiable {
 
     var configSummary: String {
         MasterDNSToml.summary(for: clientConfigToml)
+    }
+
+    var socksURL: String {
+        MasterDNSToml.socksURL(for: clientConfigToml, fallbackListenAddress: listenAddress)
+    }
+
+    var readinessIssues: [String] {
+        var issues: [String] = []
+        do {
+            _ = try MasterDNSToml.normalizedConfig(clientConfigToml)
+        } catch {
+            issues.append(error.localizedDescription)
+        }
+        do {
+            _ = try MasterDNSResolvers.normalizedList(resolversText)
+        } catch {
+            issues.append(error.localizedDescription)
+        }
+        return issues
     }
 
     static let empty = MasterDNSProfile()
@@ -188,17 +207,11 @@ enum ProfileStore {
 
     static func loadRequired() throws -> MasterDNSProfile {
         let profile = load()
-        if profile.clientConfigToml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw NSError(domain: "MasterDnsVPN", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Профиль не импортирован"
-            ])
-        }
-        if profile.resolversText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw NSError(domain: "MasterDnsVPN", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "Список DNS-резолверов пуст"
-            ])
-        }
-        return profile
+        let normalizedToml = try MasterDNSToml.normalizedConfig(profile.clientConfigToml)
+        let normalizedResolvers = try MasterDNSResolvers.normalizedList(profile.resolversText)
+        var clean = MasterDNSToml.applyingConfig(normalizedToml, to: profile)
+        clean.resolversText = normalizedResolvers
+        return clean
     }
 
     static func save(_ profile: MasterDNSProfile) throws {
@@ -249,12 +262,18 @@ enum MasterDNSToml {
 
     static func applyingConfig(_ toml: String, to profile: MasterDNSProfile) -> MasterDNSProfile {
         let listenIP = stringValue("LISTEN_IP", in: toml) ?? "127.0.0.1"
-        let listenPort = intValue("LISTEN_PORT", in: toml) ?? 10808
+        let listenPort = intValue("LISTEN_PORT", in: toml) ?? 18000
         var next = profile
         next.name = firstDomain(in: toml) ?? profile.name
         next.clientConfigToml = toml
         next.listenAddress = "\(listenIP):\(listenPort)"
         next.updatedAt = Date()
+        return next
+    }
+
+    static func internalTunnelConfig(_ toml: String) -> String {
+        var next = setValue("SOCKS5_AUTH", value: "false", in: toml)
+        next = setValue("PROTOCOL_TYPE", value: #""SOCKS5""#, in: next)
         return next
     }
 
@@ -291,9 +310,52 @@ enum MasterDNSToml {
         }
         let domain = firstDomain(in: toml) ?? "DOMAINS?"
         let listenIP = stringValue("LISTEN_IP", in: toml) ?? "127.0.0.1"
-        let listenPort = intValue("LISTEN_PORT", in: toml) ?? 10808
+        let listenPort = intValue("LISTEN_PORT", in: toml) ?? 18000
         let protocolType = stringValue("PROTOCOL_TYPE", in: toml) ?? "SOCKS5"
         return "\(domain) · \(protocolType) · \(listenIP):\(listenPort)"
+    }
+
+    static func socksURL(for toml: String, fallbackListenAddress: String) -> String {
+        let listenIP = stringValue("LISTEN_IP", in: toml) ?? fallbackListenAddress.hostPort.host
+        let listenPort = intValue("LISTEN_PORT", in: toml) ?? fallbackListenAddress.hostPort.port ?? 18000
+        let auth = boolValue("SOCKS5_AUTH", in: toml) ?? false
+        let host = listenIP == "0.0.0.0" ? "127.0.0.1" : listenIP
+        if auth {
+            let user = percentEncode(stringValue("SOCKS5_USER", in: toml) ?? "master_dns_vpn")
+            let pass = percentEncode(stringValue("SOCKS5_PASS", in: toml) ?? "master_dns_vpn")
+            return "socks5://\(user):\(pass)@\(host):\(listenPort)"
+        }
+        return "socks5://\(host):\(listenPort)"
+    }
+
+    static func boolValue(_ key: String, in toml: String) -> Bool? {
+        guard let raw = rawValue(key, in: toml) else { return nil }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "true": return true
+        case "false": return false
+        default: return nil
+        }
+    }
+
+    private static func percentEncode(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? value
+    }
+
+    private static func setValue(_ key: String, value: String, in toml: String) -> String {
+        var lines = toml.components(separatedBy: .newlines)
+        let upper = key.uppercased()
+        for idx in lines.indices {
+            let stripped = stripInlineComment(lines[idx]).trimmingCharacters(in: .whitespaces)
+            let parts = stripped.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let lhs = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            if lhs == upper {
+                lines[idx] = "\(key) = \(value)"
+                return lines.joined(separator: "\n")
+            }
+        }
+        lines.append("\(key) = \(value)")
+        return lines.joined(separator: "\n")
     }
 
     private static func rawValue(_ key: String, in toml: String) -> String? {
@@ -393,5 +455,24 @@ enum MasterDNSResolvers {
 
     private static func isIPAddress(_ text: String) -> Bool {
         IPv4Address(text) != nil || IPv6Address(text) != nil
+    }
+}
+
+extension String {
+    var hostPort: (host: String, port: Int?) {
+        if hasPrefix("["),
+           let end = firstIndex(of: "]") {
+            let host = String(self[index(after: startIndex)..<end])
+            let rest = self[index(after: end)...]
+            if rest.first == ":" {
+                return (host, Int(rest.dropFirst()))
+            }
+            return (host, nil)
+        }
+        let parts = split(separator: ":", omittingEmptySubsequences: false)
+        if parts.count == 2 {
+            return (String(parts[0]), Int(parts[1]))
+        }
+        return (self, nil)
     }
 }

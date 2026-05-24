@@ -27,6 +27,45 @@
 	<key>AppGroupIdentifier</key>
 	<string>$(APP_GROUP_ID)</string>
 
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>MasterDnsVPN TOML</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.toml</string>
+				<string>public.plain-text</string>
+				<string>public.text</string>
+			</array>
+		</dict>
+	</array>
+
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>public.toml</string>
+			<key>UTTypeDescription</key>
+			<string>TOML configuration</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>toml</string>
+				</array>
+				<key>public.mime-type</key>
+				<string>application/toml</string>
+			</dict>
+		</dict>
+	</array>
+
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 

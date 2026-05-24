@@ -1,15 +1,18 @@
 import Darwin
 import Foundation
 import MasterDnsVPNCore
+import Network
 import NetworkExtension
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let instanceID = "packet-tunnel"
     private let writerQueue = DispatchQueue(label: "masterdns.packet.writer", qos: .userInitiated)
     private var stopping = false
+    private var writerStarted = false
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         stopping = false
+        writerStarted = false
 
         do {
             let profile = try ProfileStore.loadRequired()
@@ -39,7 +42,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        let state = MobileIsRunning(instanceID) ? "running" : "stopped"
+        let running = MobileIsRunning(instanceID)
+        let bridge = MobileIsPacketBridgeRunning()
+        let state = """
+        {"engine":\(running),"bridge":\(bridge),"state":"\(running && bridge ? "running" : "stopped")"}
+        """
         completionHandler?(state.data(using: .utf8))
     }
 
@@ -49,10 +56,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         MobileStopInstance(instanceID)
         MobileStopPacketBridge()
         var startError: NSError?
+        let tunnelToml = MasterDNSToml.internalTunnelConfig(profile.clientConfigToml)
         guard MobileStartRawInstance(
             instanceID,
             dir.path,
-            profile.clientConfigToml,
+            tunnelToml,
             profile.resolversText,
             profile.listenAddress,
             &startError
@@ -61,7 +69,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 NSLocalizedDescriptionKey: "Не удалось запустить ядро MasterDnsVPN"
             ])
         }
-        Thread.sleep(forTimeInterval: 0.35)
+        try waitForLocalSocks(profile.listenAddress)
         var bridgeError: NSError?
         guard MobileStartQueuedPacketBridge(Int32(profile.mtu), profile.listenAddress, &bridgeError) else {
             throw bridgeError ?? NSError(domain: "MasterDnsVPN", code: 4, userInfo: [
@@ -105,15 +113,73 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func startPacketWriteLoop() {
+        guard !writerStarted else { return }
+        writerStarted = true
         writerQueue.async { [weak self] in
             guard let self else { return }
             while !self.stopping {
                 autoreleasepool {
                     if let packet = MobileReadQueuedPacket(250), !packet.isEmpty {
-            let proto = self.protocolNumber(for: packet)
-            self.packetFlow.writePackets([packet], withProtocols: [proto])
-        }
+                        let proto = self.protocolNumber(for: packet)
+                        self.packetFlow.writePackets([packet], withProtocols: [proto])
+                    }
                 }
+            }
+        }
+    }
+
+    private func waitForLocalSocks(_ listenAddress: String) throws {
+        let parsed = parseHostPort(listenAddress)
+        let host = parsed.host == "0.0.0.0" ? "127.0.0.1" : parsed.host
+        let port = parsed.port
+        let deadline = Date().addingTimeInterval(8)
+        var lastErrno: Int32 = 0
+        while Date() < deadline && !stopping {
+            if canConnect(host: host, port: port) {
+                return
+            }
+            lastErrno = errno
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        throw NSError(domain: "MasterDnsVPN", code: 5, userInfo: [
+            NSLocalizedDescriptionKey: "SOCKS \(host):\(port) не поднялся за 8 секунд (errno \(lastErrno))"
+        ])
+    }
+
+    private func parseHostPort(_ value: String) -> (host: String, port: Int) {
+        if value.hasPrefix("["),
+           let end = value.firstIndex(of: "]") {
+            let host = String(value[value.index(after: value.startIndex)..<end])
+            let rest = value[value.index(after: end)...]
+            if rest.first == ":", let port = Int(rest.dropFirst()) {
+                return (host, port)
+            }
+        }
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+        if parts.count == 2, let port = Int(parts[1]) {
+            return (String(parts[0]), port)
+        }
+        return ("127.0.0.1", 18000)
+    }
+
+    private func canConnect(host: String, port: Int) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var timeout = timeval(tv_sec: 0, tv_usec: 250_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else { return false }
+
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
     }
