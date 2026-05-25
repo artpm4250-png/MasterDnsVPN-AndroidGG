@@ -201,6 +201,36 @@ func IsRunning(key string) bool {
 return mobile.IsInstanceRunning(key)
 }
 
+// IsSessionReady returns true after the tunnel session is established.
+func IsSessionReady(key string) bool {
+return mobile.GetInstanceStats(key).SessionReady
+}
+
+// ResolverCount returns the total number of configured resolvers.
+func ResolverCount(key string) int {
+return mobile.GetInstanceStats(key).ResolverCount
+}
+
+// ValidResolverCount returns the number of currently usable resolvers.
+func ValidResolverCount(key string) int {
+return mobile.GetInstanceStats(key).ValidResolverCount
+}
+
+// RuntimeStatus returns a compact human-readable runtime snapshot.
+func RuntimeStatus(key string) string {
+s := mobile.GetInstanceStats(key)
+if !s.IsRunning {
+return "stopped"
+}
+return fmt.Sprintf(
+"running session=%t resolvers=%d/%d listen=%s",
+s.SessionReady,
+s.ValidResolverCount,
+s.ResolverCount,
+s.ListenAddr,
+)
+}
+
 // GetStats returns current stats for an instance.
 func GetStats(key string) *Stats {
 s := mobile.GetInstanceStats(key)

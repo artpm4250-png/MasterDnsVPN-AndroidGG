@@ -69,7 +69,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 NSLocalizedDescriptionKey: "Не удалось запустить ядро MasterDnsVPN"
             ])
         }
-        try waitForLocalSocks(profile.listenAddress)
+        try waitForEngineReady(instanceID)
+        try waitForLocalSocks(profile.listenAddress, timeout: 20)
         var bridgeError: NSError?
         guard MobileStartQueuedPacketBridge(Int32(profile.mtu), profile.listenAddress, &bridgeError) else {
             throw bridgeError ?? NSError(domain: "MasterDnsVPN", code: 4, userInfo: [
@@ -89,6 +90,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let ipv4 = NEIPv4Settings(addresses: ["10.89.0.1"], subnetMasks: ["255.255.255.255"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
+        let excluded = excludedIPv4Routes(from: profile.resolversText)
+        if !excluded.isEmpty {
+            ipv4.excludedRoutes = excluded
+        }
         settings.ipv4Settings = ipv4
 
         let ipv6 = NEIPv6Settings(addresses: ["fd00:89::1"], networkPrefixLengths: [NSNumber(value: 128)])
@@ -128,11 +133,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func waitForLocalSocks(_ listenAddress: String) throws {
+    private func waitForLocalSocks(_ listenAddress: String, timeout: TimeInterval = 90) throws {
         let parsed = parseHostPort(listenAddress)
         let host = parsed.host == "0.0.0.0" ? "127.0.0.1" : parsed.host
         let port = parsed.port
-        let deadline = Date().addingTimeInterval(8)
+        let deadline = Date().addingTimeInterval(timeout)
         var lastErrno: Int32 = 0
         while Date() < deadline && !stopping {
             if canConnect(host: host, port: port) {
@@ -142,8 +147,47 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             Thread.sleep(forTimeInterval: 0.15)
         }
         throw NSError(domain: "MasterDnsVPN", code: 5, userInfo: [
-            NSLocalizedDescriptionKey: "SOCKS \(host):\(port) не поднялся за 8 секунд (errno \(lastErrno))"
+            NSLocalizedDescriptionKey: "SOCKS \(host):\(port) не поднялся за \(Int(timeout)) секунд (errno \(lastErrno))"
         ])
+    }
+
+    private func waitForEngineReady(_ instanceID: String) throws {
+        let deadline = Date().addingTimeInterval(90)
+        var lastStatus = MobileRuntimeStatus(instanceID)
+        while Date() < deadline && !stopping {
+            if !MobileIsRunning(instanceID) {
+                let lastError = MobileGetLastError(instanceID)
+                throw NSError(domain: "MasterDnsVPN", code: 7, userInfo: [
+                    NSLocalizedDescriptionKey: lastError.isEmpty ? "ядро MasterDnsVPN остановилось" : lastError
+                ])
+            }
+            lastStatus = MobileRuntimeStatus(instanceID)
+            if MobileIsSessionReady(instanceID) && MobileValidResolverCount(instanceID) > 0 {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        throw NSError(domain: "MasterDnsVPN", code: 8, userInfo: [
+            NSLocalizedDescriptionKey: "туннель не стал готовым за 90 секунд: \(lastStatus)"
+        ])
+    }
+
+    private func excludedIPv4Routes(from resolversText: String) -> [NEIPv4Route] {
+        var routes: [NEIPv4Route] = []
+        var seen = Set<String>()
+        for line in resolversText.components(separatedBy: .newlines) {
+            var entry = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !entry.isEmpty else { continue }
+            if let slash = entry.firstIndex(of: "/") {
+                entry = String(entry[..<slash])
+            } else if let split = entry.hostPort.port, split > 0 {
+                entry = entry.hostPort.host
+            }
+            guard IPv4Address(entry) != nil, seen.insert(entry).inserted else { continue }
+            routes.append(NEIPv4Route(destinationAddress: entry, subnetMask: "255.255.255.255"))
+        }
+        return routes
     }
 
     private func parseHostPort(_ value: String) -> (host: String, port: Int) {
